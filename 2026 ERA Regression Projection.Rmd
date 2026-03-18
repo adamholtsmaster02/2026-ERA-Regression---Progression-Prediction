@@ -1,0 +1,329 @@
+---
+title: "2026 ERA Regression Prediction"
+author: "Adam Holtsmaster"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+
+library(tidyverse)
+library(janitor)
+library(tidymodels)
+library(xgboost)
+library(gt)
+
+conflicted::conflicts_prefer(dplyr::lag)
+tidymodels::tidymodels_prefer()
+set.seed(42)
+
+if (!dir.exists("outputs")) dir.create("outputs")
+
+```
+
+```{r}
+
+hist_path <- "C:/Users/Adam/Desktop/INDY/2026 ERA Projection/2018-2024 Pitching Data.csv"
+p2025_path <- "C:/Users/Adam/Desktop/INDY/2026 ERA Projection/2025 Pitching Data.csv"
+
+```
+
+```{r}
+
+hist <- readr::read_csv(hist_path, show_col_types = FALSE) %>%
+  clean_names()
+
+p2025 <- readr::read_csv(p2025_path, show_col_types = FALSE) %>%
+  clean_names()
+
+prep <- function(df){
+  df %>%
+    rename(pitcher_name = last_name_first_name) %>%
+    mutate(
+      pitcher_name = str_squish(pitcher_name),
+      player_id = as.character(player_id),
+      year = as.integer(year)
+    ) %>%
+    mutate(across(
+      c(p_win, p_loss, p_era, xwoba, sweet_spot_percent, barrel_batted_rate,
+        hard_hit_percent, avg_best_speed, avg_hyper_speed, whiff_percent, swing_percent),
+      ~ suppressWarnings(as.numeric(.x))
+    )) %>%
+    
+    mutate(decisions = coalesce(p_win, 0) + coalesce(p_loss, 0))
+}
+
+hist <- prep(hist)
+p2025 <- prep(p2025)
+
+all_df <- bind_rows(hist, p2025)
+
+```
+
+```{r}
+
+pairs <- hist %>% 
+  filter(!is.na(pitcher_name), pitcher_name !="") %>%
+  mutate(year = as.integer(year)) %>%
+  arrange(pitcher_name, year) %>%
+  group_by(pitcher_name) %>%
+  mutate(
+    era_next = lead(p_era),
+    year_next = lead(year)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(era_next),year_next == year + 1)
+
+pairs <- pairs %>%         
+  filter(!is.na(p_era), !is.na(xwoba)) %>%
+  filter(!is.na(whiff_percent) | !is.na(hard_hit_percent) | !is.na(barrel_batted_rate))
+
+pairs <- pairs %>% 
+  mutate(
+    p_era = pmin(pmax(p_era, 0.50), 12.00),
+    era_next = pmin(pmax(era_next, 0.50), 12.00)
+  )
+  
+hist <- hist %>% 
+  filter(!is.na(player_id), player_id != "") %>%
+  mutate(year = as.integer(year))
+
+```
+
+```{r}
+
+pairs <- pairs %>%
+  group_by(player_id) %>%
+  arrange(year) %>%
+  mutate(
+    #year-over-year deltas
+    d_xwoba = xwoba - lag(xwoba),
+    d_whiff = whiff_percent - lag(whiff_percent),
+    d_hardhit = hard_hit_percent - lag(hard_hit_percent),
+    d_barrel = barrel_batted_rate - lag(barrel_batted_rate),
+    d_swing = swing_percent - lag(swing_percent),
+    d_ear = p_era - lag(p_era),
+    d_decisions = decisions - lag(decisions),
+    #2 year rolling averages
+    xwoba_2yr = (xwoba + lag(xwoba)) / 2,
+    whiff_2yr = (whiff_percent + lag(whiff_percent)) / 2,
+    hardhit_2yr = (hard_hit_percent + lag(hard_hit_percent)) / 2, 
+    barrel_2yr = (barrel_batted_rate + lag(barrel_batted_rate)) / 2,
+    decisions_2yr = (decisions + lag(decisions)) / 2,
+    # gap signal
+    era_wxoba_gap = p_era - xwoba,
+    #velocity signals
+    velo_gap = avg_best_speed - avg_hyper_speed
+  ) %>%
+  ungroup()
+
+```
+
+```{r}
+max_pair_year <- max(pairs$year, na.rm = TRUE)
+holdout_years <- c(max_pair_year - 1, max_pair_year)
+
+train_set <- pairs %>% filter(!year %in% holdout_years)
+test_set  <- pairs %>% filter(!year %in% holdout_years)
+
+```
+
+```{r}
+
+predictors <- c(
+  "p_era","xwoba","sweet_spot_percent","barrel_batted_rate","hard_hit_percent","avg_best_speed","avgZ_hyper_speed","velo_gap","whiff_percent","swing_percent","decisions","d_xwoba","d_whiff","d_hardhit","d_barrel","d_swing", "d_era", "xwoba_2yr","whiff_2yr","hardhit_2yr","barrel_2yr","era_xwoba_gap", "d_decisions", "decisions_2yr"
+)
+
+predictors <- intersect(predictors, names(train_set))
+
+train_mod <- train_set %>% 
+  select(pitcher_name, year, era_next, any_of(predictors))
+
+test_mod <- test_set %>% 
+  select(pitcher_name, year, era_next, any_of(predictors))
+
+cat("pairs rows:", nrow(pairs), "\n")
+cat("train_set rows:", nrow(train_set), "\n")
+cat("test_set rows:", nrow(test_set), "\n")
+cat("train_mod rows:", nrow(train_mod), "\n")
+
+rec <- recipe(era_next ~ ., data = train_mod) %>%
+  update_role(pitcher_name, year, new_role = "id") %>%
+  step_impute_median(all_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors())
+
+xgb_spec <- boost_tree(
+  mode = "regression",
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  min_n = tune(),
+  loss_reduction = tune(), 
+  mtry = tune()
+) %>% set_engine("xgboost")
+
+wf <- workflow() %>% add_recipe(rec) %>% add_model(xgb_spec)
+
+v <- min(5, nrow(train_mod))
+if (v < 2) stop("train_mod has fewer than 2 rows. Your Year N -> Year N+1pairs are not being created.")
+folds <- vfold_cv(train_mod, v = v)
+
+xgb_spec <- boost_tree(
+  mode = "regression",
+  trees = 800,
+  tree_depth = 4,
+  learn_rate = 0.05,
+  min_n = 10
+) %>%
+  set_engine("xgboost")
+
+wf <- workflow() %>% 
+  add_recipe(rec) %>%
+  add_model(xgb_spec)
+
+final_fit <- wf %>% fit(data = train_mod)
+
+holdout_preds <- predict(final_fit, test_mod) %>%
+  bind_cols(test_mod %>% select(pitcher_name, year, era_next))
+
+holdout_metrics <- holdout_preds %>% 
+  metrics(truth = era_next, estimate = .pred)
+
+readr::write_csv(holdout_metrics, file.path("outputs", "model_metrics_holdout.csv"))
+
+```
+
+```{r}
+
+score_year <- 2025
+
+score_2025 <- all_df %>%
+  filter(year == score_year) %>%
+  select(player_id, pitcher_name, year, any_of(setdiff(predictors, c("d_xwoba","d_whiff","d_hardhit","d_barrel","d_swing","d_era",
+                                                                    "xwoba_2yr","whiff_2yr","hardhit_2yr","barrel_2yr",
+                                                                    "era_xwoba_gap","velo_gap")))) %>%
+
+  left_join(
+    all_df %>%
+      filter(year == score_year - 1) %>%
+      transmute(
+        player_id,
+        xwoba_prev = xwoba,
+        whiff_prev = whiff_percent,
+        hardhit_prev = hard_hit_percent,
+        barrel_prev = barrel_batted_rate,
+        swing_prev = swing_percent,
+        era_prev = p_era,
+        best_prev = avg_best_speed,
+        hyper_prev = avg_hyper_speed,
+        decisions_prev = decisions
+      ),
+    by = "player_id"
+  ) %>%
+
+  mutate(
+    velo_gap = 0,
+    d_xwoba   = xwoba - xwoba_prev,
+    d_whiff   = whiff_percent - whiff_prev,
+    d_hardhit = hard_hit_percent - hardhit_prev,
+    d_barrel  = barrel_batted_rate - barrel_prev,
+    d_swing   = swing_percent - swing_prev,
+    d_era     = p_era - era_prev,
+    xwoba_2yr   = (xwoba + xwoba_prev) / 2,
+    whiff_2yr   = (whiff_percent + whiff_prev) / 2,
+    hardhit_2yr = (hard_hit_percent + hardhit_prev) / 2,
+    barrel_2yr  = (barrel_batted_rate + barrel_prev) / 2,
+    era_xwoba_gap = p_era - xwoba,
+    era_next = NA_real_,
+    d_decisions = decisions - decisions_prev,
+    decisions_2yr = (decisions + decisions_prev) / 2
+  ) %>%
+  select(player_id, pitcher_name, year, era_next, any_of(predictors))
+
+proj_2026 <- predict(final_fit, score_2025) %>%
+  bind_cols(score_2025 %>% select(player_id, pitcher_name, year)) %>%
+  rename(era_2026_proj = .pred) %>%
+  left_join(
+    all_df %>% filter(year == score_year) %>%
+      select(player_id, p_era, xwoba, whiff_percent, hard_hit_percent, barrel_batted_rate),
+    by = "player_id"
+  ) %>%
+  mutate(
+    delta_era = era_2026_proj - p_era
+  ) %>%
+  arrange(era_2026_proj)
+
+readr::write_csv(proj_2026, file.path("outputs", "era_2026_projections.csv"))
+
+```
+
+```{r}
+
+comeback <- proj_2026 %>% arrange(delta_era) %>% slice_head(n = 25)
+regress <- proj_2026 %>% arrange(desc(delta_era)) %>% slice_head(n = 25)
+
+comeback_gt <- comeback %>%
+  select(pitcher_name, p_era, era_2026_proj, delta_era, xwoba, whiff_percent, hard_hit_percent, barrel_batted_rate) %>%
+  gt() %>%
+  tab_header(
+    title = "Pitchers to Improve in 2026",
+    subtitle = "Negative ΔERA = projected improvement (2026 proj − 2025 ERA)"
+  ) %>%
+  cols_label(
+    pitcher_name = "Pitcher",
+    p_era = "2025 ERA",
+    era_2026_proj = "Projected 2026 ERA",
+    delta_era = "ΔERA",
+    xwoba = "xwOBA",
+    whiff_percent = "Whiff%",
+    hard_hit_percent = "HardHit%",
+    barrel_batted_rate = "Barrel%",
+  ) %>%
+  fmt_number(columns = c(p_era, era_2026_proj, delta_era, xwoba), decimals = 2) %>%
+  fmt_number(columns = c(whiff_percent, hard_hit_percent, barrel_batted_rate), decimals = 1)
+
+regression_gt <- regress %>%
+  select(pitcher_name, p_era, era_2026_proj, delta_era, xwoba, whiff_percent, hard_hit_percent, barrel_batted_rate) %>%
+  gt() %>%
+  tab_header(
+    title = "Players at Risk of Regression in 2026",
+    subtitle = "Positive ΔERA = projected decline (2026 proj − 2025 ERA)"
+  ) %>%
+  cols_label(
+    pitcher_name = "Pitcher",
+    p_era = "2025 ERA",
+    era_2026_proj = "Projected 2026 ERA",
+    delta_era = "ΔERA",
+    xwoba = "xwOBA",
+    whiff_percent = "Whiff%",
+    hard_hit_percent = "HardHit%",
+    barrel_batted_rate = "Barrel%",
+  ) %>%
+  fmt_number(columns = c(p_era, era_2026_proj, delta_era, xwoba), decimals = 2) %>%
+  fmt_number(columns = c(whiff_percent, hard_hit_percent, barrel_batted_rate), decimals = 1)
+
+comeback_gt
+regression_gt
+
+gtsave(comeback_gt, file.path("outputs", "improve_2026.html"))
+gtsave(regression_gt, file.path("outputs", "regression_2026.html"))
+
+```
+
+```{r}
+
+p_holdout <- ggplot(holdout_preds, aes(x = era_next, y = .pred)) +
+  geom_point(alpha = 0.35) +
+  geom_abline(slope = 1, intercept = 0) +
+  labs(
+    title = "Holdout: Predicted vs Actual Next-Year ERA",
+    subtitle = paste0("Holdout years: ", paste(holdout_years, collapse = ", ")),
+    x = "Actual ERA (Year N+1)",
+    y = "Predicted ERA (Year N+1)"
+  ) +
+  theme_minimal(base_size = 12)
+
+ggsave(file.path("outputs", "holdout_pred_vs_actual.png"), p_holdout, width = 7, height = 5, dpi = 300)
+
+```
